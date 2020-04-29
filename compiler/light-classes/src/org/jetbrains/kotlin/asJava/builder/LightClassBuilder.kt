@@ -43,6 +43,7 @@ fun buildLightClass(
 ): LightClassBuilderResult {
     val project = files.first().project
 
+    println("BUILD LIGHT CLASS L:(")
     try {
         val classBuilderFactory = KotlinLightClassBuilderFactory(createJavaFileStub(project, packageFqName, files))
         val state = GenerationState.Builder(
