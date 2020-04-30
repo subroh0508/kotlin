@@ -16,6 +16,7 @@ import com.intellij.codeInspection.ex.EntryPointsManagerBase
 import com.intellij.codeInspection.ex.EntryPointsManagerImpl
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.module.Module
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.project.Project
 import com.intellij.psi.PsiClass
@@ -44,7 +45,6 @@ import org.jetbrains.kotlin.idea.caches.resolve.analyze
 import org.jetbrains.kotlin.idea.caches.resolve.findModuleDescriptor
 import org.jetbrains.kotlin.idea.caches.resolve.resolveToDescriptorIfAny
 import org.jetbrains.kotlin.idea.core.isInheritable
-import org.jetbrains.kotlin.idea.core.script.ScriptConfigurationManager
 import org.jetbrains.kotlin.idea.core.toDescriptor
 import org.jetbrains.kotlin.idea.debugger.coroutine.util.logger
 import org.jetbrains.kotlin.idea.findUsages.KotlinFindUsagesHandlerFactory
@@ -69,6 +69,7 @@ import org.jetbrains.kotlin.idea.search.usagesSearch.getClassNameForCompanionObj
 import org.jetbrains.kotlin.idea.stubindex.KotlinSourceFilterScope
 import org.jetbrains.kotlin.idea.util.ProjectRootsUtil
 import org.jetbrains.kotlin.idea.util.hasActualsFor
+import org.jetbrains.kotlin.idea.util.projectStructure.module
 import org.jetbrains.kotlin.js.resolve.diagnostics.findPsi
 import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.name.FqName
@@ -89,6 +90,18 @@ import javax.swing.JComponent
 import javax.swing.JPanel
 
 class UnusedSymbolInspection : AbstractKotlinInspection() {
+    override fun inspectionFinished(session: LocalInspectionToolSession, problemsHolder: ProblemsHolder) {
+        super.inspectionFinished(session, problemsHolder)
+        if (log.isDebugEnabled)
+            log.debug("[${Thread.currentThread().name}] Inspection session finished: $session ${this.javaClass.simpleName} / ${problemsHolder.resultCount} found.")
+    }
+
+    override fun inspectionStarted(session: LocalInspectionToolSession, isOnTheFly: Boolean) {
+        super.inspectionStarted(session, isOnTheFly)
+        if (log.isDebugEnabled)
+            log.debug("[${Thread.currentThread().name}] Inspection started $session ${this.javaClass.simpleName} / $isOnTheFly")
+    }
+
     companion object {
         val log by logger
 
@@ -104,7 +117,7 @@ class UnusedSymbolInspection : AbstractKotlinInspection() {
             this is KtNamedDeclaration && checkAnnotatedUsingPatterns(this, KOTLIN_ADDITIONAL_ANNOTATIONS)
 
         fun isEntryPoint(declaration: KtNamedDeclaration): Boolean {
-            val declarationInfo = KtNamedDeclarationInfo(declaration)
+            val declarationInfo = KtNamedDeclarationInfo(declaration, declaration.module)
             return isEntryPoint(declarationInfo)
         }
 
@@ -140,7 +153,7 @@ class UnusedSymbolInspection : AbstractKotlinInspection() {
             return javaInspection.isEntryPoint(lightElement)
         }
 
-        class KtNamedDeclarationInfo(val declaration: KtNamedDeclaration) {
+        class KtNamedDeclarationInfo(val declaration: KtNamedDeclaration, val module: Module? = declaration.module) {
             val costResult: SearchCostResult by lazy {
                 isCheapEnoughToSearchUsages(this)
             }
@@ -151,28 +164,51 @@ class UnusedSymbolInspection : AbstractKotlinInspection() {
             val project = declaration.project
             val psiSearchHelper = PsiSearchHelper.getInstance(project)
 
-            val usedScripts = findScriptsWithUsages(declaration)
-            if (usedScripts.isNotEmpty()) {
-                if (!ScriptConfigurationManager.getInstance(declaration.project).updater.ensureConfigurationUpToDate(usedScripts)) {
-                    return TOO_MANY_OCCURRENCES
-                }
-            }
-
             val useScope = psiSearchHelper.getUseScope(declaration)
-            if (useScope is GlobalSearchScope) {
-                var zeroOccurrences = true
-                for (name in listOf(declaration.name) + declaration.getAccessorNames() + listOfNotNull(declaration.getClassNameForCompanionObject())) {
-                    if (name == null) continue
-                    when (psiSearchHelper.isCheapEnoughToSearchConsideringOperators(name, useScope, null, null)) {
-                        ZERO_OCCURRENCES -> {
-                        } // go on, check other names
-                        FEW_OCCURRENCES -> zeroOccurrences = false
-                        TOO_MANY_OCCURRENCES -> return TOO_MANY_OCCURRENCES // searching usages is too expensive; behave like it is used
-                    }
-                }
 
-                if (zeroOccurrences) return ZERO_OCCURRENCES
+            if (useScope is GlobalSearchScope) {
+                val moduleScope = declarationInfo.module?.moduleScope
+                var cost = isCheapEnoughToSearchUsagesInModuleScope(declaration, project, moduleScope)
+                if (cost == ZERO_OCCURRENCES) { // if nothing found in the module, check everything else
+                    cost = isCheapEnoughToSearchUsagesInScope(declaration, project, useScope)
+                }
+                return cost
             }
+            return FEW_OCCURRENCES
+        }
+
+        private fun isCheapEnoughToSearchUsagesInModuleScope(
+            declaration: KtNamedDeclaration,
+            project: Project,
+            searchScope: GlobalSearchScope?
+        ): SearchCostResult =
+            searchScope?.let { isCheapEnoughToSearchUsagesInScope(declaration, project, searchScope) } ?: ZERO_OCCURRENCES
+
+        private fun isCheapEnoughToSearchUsagesInScope(
+            declaration: KtNamedDeclaration,
+            project: Project,
+            searchScope: GlobalSearchScope
+        ): SearchCostResult {
+            val psiSearchHelper = PsiSearchHelper.getInstance(project)
+            val declarationName = declaration.name.takeIf { it?.isNotBlank() == true }
+            var zeroOccurrences = true
+            for (name in listOf(declarationName) + declaration.getAccessorNames() + listOfNotNull(declaration.getClassNameForCompanionObject())) {
+                if (name == null) continue
+                val cheapEnoughToSearchConsideringOperators =
+                    psiSearchHelper.isCheapEnoughToSearchConsideringOperators(name, searchScope, null, null)
+                when (cheapEnoughToSearchConsideringOperators) {
+                    ZERO_OCCURRENCES -> {
+                    } // go on, check other names
+                    FEW_OCCURRENCES -> zeroOccurrences = false
+                    TOO_MANY_OCCURRENCES -> return TOO_MANY_OCCURRENCES // searching usages is too expensive; behave like it is used
+                }
+            }
+            if (declarationName != null) {
+                val usedScripts = findScriptsWithUsages(declarationName, project, searchScope)
+                if (usedScripts.isNotEmpty())
+                    return TOO_MANY_OCCURRENCES
+            }
+            if (zeroOccurrences) return ZERO_OCCURRENCES
             return FEW_OCCURRENCES
         }
 
@@ -218,6 +254,7 @@ class UnusedSymbolInspection : AbstractKotlinInspection() {
         return namedDeclarationVisitor(fun(declaration) {
             ProgressManager.checkCanceled()
             log.debug("naming ${declaration} ${declaration.nameAsSafeName}")
+            val module = declaration.module
             val message = declaration.describe()?.let { "$it is never used" } ?: return
 
             if (!ProjectRootsUtil.isInProjectSource(declaration)) return
@@ -236,7 +273,7 @@ class UnusedSymbolInspection : AbstractKotlinInspection() {
             val descriptor = declaration.resolveToDescriptorIfAny() ?: return
             if (descriptor is FunctionDescriptor && descriptor.isOperator) return
 
-            val declarationInfo = KtNamedDeclarationInfo(declaration)
+            val declarationInfo = KtNamedDeclarationInfo(declaration, module)
             if (isEntryPoint(declarationInfo)) return
             if (declaration.isFinalizeMethod(descriptor)) return
             if (declaration is KtProperty && declaration.isSerializationImplicitlyUsedField()) return
